@@ -26,7 +26,13 @@ from scipy.io import savemat, loadmat
 #imagesDir = "/auto/shared/client_data/wada/potato_images/raws/yellow_potatoes_nov_2019/"
 #imagesDir = "/auto/shared/client_data/wada/potato_images/raws/yellow_raws_dec_2019/"
 #imagesDir = "/auto/shared/client_data/wada/potato_images/raws/bad_dec_18_2019/"
-imagesDir = "ValidationData/raw/"
+#imagesDir = "ValidationData/raw/"
+#imagesDir = "/auto/shared/client_data/wada/sift_ai_images/SVW-C7FC96/skin_check_jan_24_2019/raw"
+#imagesDir = "/auto/shared/client_data/wada/volume_and_height_estimation/volume_est_2019-10-23/raw"
+#imagesDir = "/auto/shared/client_data/wada/volume_and_height_estimation/height_est_2019-11-04/raw"
+#imagesDir = "/auto/shared/client_data/wada/potato_images/raws/mud_low_res_feb_11"
+#imagesDir = "/auto/shared/client_data/wada/sift_ai_images/SVW-87A6B9/runtime_raw_jan_7_2020/raw"
+imagesDir = "/auto/shared/client_data/wada/potato_images/raws/mud_jan_6_2020/raw"
 
 #segmentModelFile = "models/segment_Sep_19.pb"
 #segmentModelFile = "models/taters_segment_original.pb"
@@ -39,10 +45,10 @@ imagesDir = "ValidationData/raw/"
 #segmentModelFile = "models/atWadaDec30.pb"
 segmentModelFile = "models/Dec23-1708-Segment.pb"
 
-write_mask = True
+write_mask = False
 write_raw_with_contours = True
 write_segmented = True
-write_mat_mask = True
+write_mat_mask = False
 os.system("rm -rf segment_raw_output")
 os.system("mkdir segment_raw_output")
 os.system("mkdir segment_raw_output/masks")
@@ -62,18 +68,31 @@ def load_graph(frozen_graph_filename):
 def main():
     segmentGraph = load_graph(segmentModelFile)
 
-    for op in segmentGraph.get_operations():
-        print(op.name)
-        pass
+    input_img_tensor_segment = "none"
+    output_img_tensor_segment = "none"
 
-    input_img_tensor_segment = segmentGraph.get_tensor_by_name('prefix/conv2d_1_input:0')
-    output_img_tensor_segment = segmentGraph.get_tensor_by_name('prefix/Softmax/truediv:0')
+    activationFunction = "none"
+    for op in segmentGraph.get_operations():
+        if "input" in op.name:
+            input_img_tensor_segment = segmentGraph.get_tensor_by_name(op.name + ":0")
+        if "Softmax" in op.name:
+            activationFunction = "softmax"
+            output_img_tensor_segment = segmentGraph.get_tensor_by_name(op.name + ":0")
+        if "Sigmoid" in op.name:
+            activationFunction = "sigmoid"
+            output_img_tensor_segment = segmentGraph.get_tensor_by_name(op.name + ":0")
+        print(op.name)
+
+    if input_img_tensor_segment == "none" or output_img_tensor_segment == "none":
+        print("Could not find input tensor and/or output tensor in graph!")
+        exit()
 
 
     with tf.Session(graph=segmentGraph) as sess:
-        for imageNum, f in enumerate(glob.iglob(os.path.join(imagesDir, "*.png"))):
+        numberSkipped = 0
+        for imageNum, f in enumerate(glob.iglob(os.path.join(imagesDir, "*.png"))): #iglob works much better with very large lists of files
+        #for imageNum, f in enumerate(sorted(glob.glob(os.path.join(imagesDir, "*.png")))):
             imgSize = 224
-            print (f)
             img_in = cv2.imread(f, 1)
 
             img_in = img_in #/ 255.0
@@ -83,6 +102,7 @@ def main():
                 img_in = cv2.resize(img_in, (imgSize, imgSize))
             except:
                 print("error resizing image")
+                numberSkipped += 1
                 continue
             img_in = np.reshape(img_in, (1, imgSize, imgSize, 3))
 
@@ -90,11 +110,17 @@ def main():
 
             pred = sess.run(output_img_tensor_segment, feed_dict={ input_img_tensor_segment: img_in})
         
-            pred = pred[:,:,:,0]
-            pred = np.squeeze(pred)
+            if activationFunction == "softmax":
+                pred = pred[:,:,:,0]
+                pred = np.squeeze(pred)
+                pred = cv2.resize(pred, (img_original.shape[1],img_original.shape[0]))
 
-            pred = cv2.resize(pred, (img_original.shape[1],img_original.shape[0]))
-
+            if activationFunction == "sigmoid":
+                pred = np.squeeze(pred)
+                pred = np.reshape(pred, (224, 224))
+                pred = 1.0 - pred
+                pred = cv2.resize(pred, (img_original.shape[1],img_original.shape[0]))
+                
             pred_thresh = np.copy(pred)
             pred_thresh[pred_thresh < 0.5] = 0
             pred_thresh[pred_thresh >= 0.5] = 1.0
@@ -104,7 +130,9 @@ def main():
             thresh[thresh == 0] = 1
             thresh[thresh == 2] = 0
 
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, (3,3))
+            #thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, (3,3))
+            kernel = np.ones((3,3),np.uint8)
+            thresh = cv2.erode(thresh,kernel,iterations = 1)
 
             #Find contours and segment them all out
             contours, hierarchy = cv2.findContours(thresh,cv2.RETR_TREE,cv2.CHAIN_APPROX_SIMPLE)
@@ -151,6 +179,11 @@ def main():
 
                 # the order of the box points: bottom left, top left, top right, bottom right (x,y)
                 if x <= 10 or x + w >= img_original.shape[1]-10:
+                    numberSkipped += 1
+                    continue
+
+                if y <= 10 or y + h >= img_original.shape[0]-10:
+                    numberSkipped += 1
                     continue
 
                 boarderSize = 10
@@ -169,12 +202,14 @@ def main():
                 width = int(rect[1][0] )
                 height = int(rect[1][1] )
                 if height * width < 3500:
+                        numberSkipped += 1
                         continue
 
                 aspectRatio = width / float(height)
                 if aspectRatio < 1.0:
                     aspectRatio = aspectRatio / 1.0
                 if aspectRatio > 4.0:
+                    numberSkipped += 1
                     continue
 
                 src_pts = box.astype("float32")
@@ -188,23 +223,17 @@ def main():
 
                 if warped.shape[1] < warped.shape[0]:
                     warped = cv2.rotate(warped,  cv2.ROTATE_90_CLOCKWISE)
-       
-                warped_original = np.copy(warped)
-                warped = cv2.resize(warped, (256, 256))
-                warped = np.reshape(warped, (1, 256, 256, 3))
-
-                warped = warped.astype(np.float32)
-                warped = warped / 255.0
-
+      
                 minX = x
-                bestImage['img'] = warped_original
+                bestImage['img'] = warped
                 bestImage['name'] = os.path.basename(f)
          
             if write_segmented:
                 try:
                     cv2.imwrite(os.path.join("segment_raw_output/segmented", bestImage['name']), bestImage['img'])
                 except:
-                    print("none found")
+                    numberSkipped += 1
+                    print("none found in ", f)
             
             if write_mat_mask:
                 mat_contents = {}
@@ -223,6 +252,6 @@ def main():
             if write_raw_with_contours:
                 cv2.imwrite(os.path.join("segment_raw_output/raw_with_contours", os.path.basename(f)), img_original)
                 
-        print ("Done")
+        print("Done. Skipped", numberSkipped, "images(s)")
 
 main()
